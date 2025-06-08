@@ -180,17 +180,14 @@ GET /api/v1/pleroma/media/stats
    - Changeset validations
    - Query helpers for user uploads
    - Deduplication logic
+   - Reference counting
 
-3. **`Pleroma.Upload.PostUpload`**
-   - Schema for post_uploads table
-   - Association management
-   - Query helpers for post uploads
-
-4. **`Pleroma.Upload.UserMedia`**
+3. **`Pleroma.Upload.UserMedia`**
    - Core business logic
-   - Coordinates between UserUpload and PostUpload
+   - Query user's uploads from UserUpload
+   - Find all activities using a media object
    - Validation of ownership
-   - Reference counting for deduplicated files
+   - Coordinate media deletion across activities
    - Integration with storage backends
 
 5. **`Pleroma.Upload.MediaStats`**
@@ -227,11 +224,10 @@ The backfill process will work as follows:
 
 2. **Batch Processing**
    - Process activities in batches of 1000
-   - For each local activity with attachments:
+   - For each local Create activity with attachments:
      a. Extract media objects from the activity
-     b. Create user_upload records
-     c. Create post_upload associations
-     d. Calculate file hash if needed
+     b. Create user_upload records with activity_id
+     c. Calculate file hash if needed
    - Track progress in a dedicated table
    - Allow resuming from last processed ID
 
@@ -244,7 +240,7 @@ The backfill process will work as follows:
 
 #### Database Schema
 
-1. **New Tables**
+1. **New Table**
 
    ```sql
    -- Associates users with their uploads
@@ -252,6 +248,7 @@ The backfill process will work as follows:
      id BIGSERIAL PRIMARY KEY,
      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
      object_id BIGINT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+     activity_id BIGINT REFERENCES activities(id) ON DELETE CASCADE, -- The Create activity for this upload
      file_hash VARCHAR(64), -- SHA256 hash for deduplication tracking
      file_path TEXT NOT NULL,
      file_size BIGINT NOT NULL,
@@ -264,23 +261,17 @@ The backfill process will work as follows:
    
    CREATE INDEX user_uploads_user_id_idx ON user_uploads(user_id);
    CREATE INDEX user_uploads_object_id_idx ON user_uploads(object_id);
+   CREATE INDEX user_uploads_activity_id_idx ON user_uploads(activity_id);
    CREATE INDEX user_uploads_file_hash_idx ON user_uploads(file_hash);
    CREATE INDEX user_uploads_inserted_at_idx ON user_uploads(inserted_at);
-   
-   -- Associates posts/activities with uploads
-   CREATE TABLE post_uploads (
-     id BIGSERIAL PRIMARY KEY,
-     activity_id BIGINT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
-     object_id BIGINT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
-     user_upload_id BIGINT REFERENCES user_uploads(id) ON DELETE SET NULL,
-     inserted_at TIMESTAMP NOT NULL DEFAULT NOW(),
-     UNIQUE(activity_id, object_id)
-   );
-   
-   CREATE INDEX post_uploads_activity_id_idx ON post_uploads(activity_id);
-   CREATE INDEX post_uploads_object_id_idx ON post_uploads(object_id);
-   CREATE INDEX post_uploads_user_upload_id_idx ON post_uploads(user_upload_id);
    ```
+   
+   **Why only one table?**
+   - Activities already track which user posted (actor)
+   - Objects already contain attachments array
+   - Storing activity_id avoids slow JSONB queries
+   - Direct lookup of where media is used
+   - No need for a separate post_uploads table
 
 2. **Deduplication Support**
    - Track file_hash to identify deduplicated files
@@ -296,13 +287,13 @@ The backfill process will work as follows:
 
 4. **Deletion Flow**
    - When a user deletes media:
-     a. Find all activities where the user attached this media
-     b. Update each activity to remove the attachment
-     c. Federate Update activities for each modified post
-     d. Remove the user_upload record
-     e. Check if any other users reference the same file (via file_hash)
-     f. Only delete physical file if no references remain
-     g. Clean up post_uploads entries
+     a. Look up the user_upload record
+     b. Find all activities where this media is used (via activity_id and by searching attachments)
+     c. Update each activity to remove the attachment
+     d. Federate Update activities for each modified post
+     e. Delete the user_upload record
+     f. Check if any other users reference the same file (via file_hash)
+     g. Only delete physical file if no references remain
 
 ### Security Considerations
 
@@ -337,17 +328,15 @@ The backfill process will work as follows:
 ### Phase 1: Database Foundation (TDD)
 - [ ] Write tests for UserUpload schema and changesets
 - [ ] Implement UserUpload module
-- [ ] Write tests for PostUpload schema and associations
-- [ ] Implement PostUpload module
-- [ ] Create database migrations for new tables
+- [ ] Create database migration for user_uploads table
 - [ ] Write tests for deduplication logic
-- [ ] Implement file hash tracking
+- [ ] Implement file hash tracking and reference counting
 
 ### Phase 2: Core Upload Tracking
 - [ ] Write tests for upload creation hooks
 - [ ] Modify Upload module to create UserUpload records
-- [ ] Write tests for activity-upload associations
-- [ ] Hook into CommonAPI to create PostUpload records
+- [ ] Write tests for activity association
+- [ ] Hook into CommonAPI to store activity_id in UserUpload
 - [ ] Write tests for reference counting
 - [ ] Implement reference counting logic
 
