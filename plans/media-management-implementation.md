@@ -38,6 +38,14 @@ This implementation will address these gaps while integrating seamlessly with Pl
 
 ## Implementation Design
 
+### Test-Driven Development Approach
+
+This implementation will follow strict TDD principles:
+1. Write failing tests for each feature before implementation
+2. Implement minimal code to make tests pass
+3. Refactor while keeping tests green
+4. Maintain high test coverage (>90%)
+
 ### API Endpoints
 
 All endpoints will be under `/api/v1/pleroma/media/`:
@@ -99,7 +107,13 @@ DELETE /api/v1/pleroma/media/:id
 ```
 **Response:** 204 No Content on success
 
-**Note:** Will fail if media is currently used in posts or profile.
+**Behavior:**
+1. Find all posts by the user that include this media
+2. Remove the attachment from each post
+3. Send Update activities to federate the changes
+4. Remove the user's association with the upload
+5. Delete the physical file if no other users reference it
+6. Update any cached post representations
 
 #### Bulk Delete Media
 ```
@@ -161,46 +175,134 @@ GET /api/v1/pleroma/media/stats
    - Parameter validation
    - Response formatting
 
-2. **`Pleroma.Upload.UserMedia`**
+2. **`Pleroma.Upload.UserUpload`**
+   - Schema for user_uploads table
+   - Changeset validations
+   - Query helpers for user uploads
+   - Deduplication logic
+
+3. **`Pleroma.Upload.PostUpload`**
+   - Schema for post_uploads table
+   - Association management
+   - Query helpers for post uploads
+
+4. **`Pleroma.Upload.UserMedia`**
    - Core business logic
-   - Query building and optimization
+   - Coordinates between UserUpload and PostUpload
    - Validation of ownership
+   - Reference counting for deduplicated files
    - Integration with storage backends
 
-3. **`Pleroma.Upload.MediaStats`**
+5. **`Pleroma.Upload.MediaStats`**
    - Calculate usage statistics
    - Cache management for performance
-   - Aggregation queries
+   - Aggregation queries across new tables
 
-4. **`Pleroma.Workers.MediaDeletionWorker`**
+6. **`Pleroma.Workers.MediaDeletionWorker`**
    - Background processing for bulk deletions
-   - Safe cleanup with rollback support
+   - Update posts to remove attachments
+   - Federate Update activities for modified posts
+   - Safe cleanup with deduplication checks
+   - Physical file deletion only when no references remain
    - Progress tracking
 
-#### Database Optimizations
+7. **`Pleroma.Workers.MediaBackfillWorker`**
+   - Process historical uploads for backfilling
+   - Batch processing to avoid overwhelming the system
+   - Resume capability for interrupted jobs
 
-1. **New Indexes**
+8. **Mix Tasks**
+   - `mix pleroma.media.backfill` - Backfill historical upload associations
+   - `mix pleroma.media.stats` - Display media statistics
+   - `mix pleroma.media.cleanup` - Clean orphaned media files
+
+#### Backfill Process
+
+The backfill process will work as follows:
+
+1. **Determine Starting Point**
+   - Find the oldest entry in user_uploads table
+   - If empty, process all local activities
+   - If populated, process activities older than the oldest upload
+
+2. **Batch Processing**
+   - Process activities in batches of 1000
+   - For each local activity with attachments:
+     a. Extract media objects from the activity
+     b. Create user_upload records
+     c. Create post_upload associations
+     d. Calculate file hash if needed
+   - Track progress in a dedicated table
+   - Allow resuming from last processed ID
+
+3. **Safety Measures**
+   - Dry run mode to preview changes
+   - Configurable batch size
+   - Rate limiting to prevent overload
+   - Progress reporting
+   - Rollback capability
+
+#### Database Schema
+
+1. **New Tables**
+
    ```sql
-   CREATE INDEX objects_actor_index ON objects ((data->>'actor'));
-   CREATE INDEX objects_type_index ON objects ((data->>'type'));
-   CREATE INDEX objects_uploaded_at_index ON objects ((data->>'published'));
+   -- Associates users with their uploads
+   CREATE TABLE user_uploads (
+     id BIGSERIAL PRIMARY KEY,
+     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     object_id BIGINT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+     file_hash VARCHAR(64), -- SHA256 hash for deduplication tracking
+     file_path TEXT NOT NULL,
+     file_size BIGINT NOT NULL,
+     content_type VARCHAR(255),
+     description TEXT,
+     inserted_at TIMESTAMP NOT NULL DEFAULT NOW(),
+     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+     UNIQUE(user_id, object_id)
+   );
+   
+   CREATE INDEX user_uploads_user_id_idx ON user_uploads(user_id);
+   CREATE INDEX user_uploads_object_id_idx ON user_uploads(object_id);
+   CREATE INDEX user_uploads_file_hash_idx ON user_uploads(file_hash);
+   CREATE INDEX user_uploads_inserted_at_idx ON user_uploads(inserted_at);
+   
+   -- Associates posts/activities with uploads
+   CREATE TABLE post_uploads (
+     id BIGSERIAL PRIMARY KEY,
+     activity_id BIGINT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+     object_id BIGINT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+     user_upload_id BIGINT REFERENCES user_uploads(id) ON DELETE SET NULL,
+     inserted_at TIMESTAMP NOT NULL DEFAULT NOW(),
+     UNIQUE(activity_id, object_id)
+   );
+   
+   CREATE INDEX post_uploads_activity_id_idx ON post_uploads(activity_id);
+   CREATE INDEX post_uploads_object_id_idx ON post_uploads(object_id);
+   CREATE INDEX post_uploads_user_upload_id_idx ON post_uploads(user_upload_id);
    ```
 
-2. **Media View** (Optional)
-   ```sql
-   CREATE VIEW user_media AS
-   SELECT 
-     id,
-     data->>'actor' as actor,
-     data->>'url' as url,
-     data->>'mediaType' as media_type,
-     data->>'name' as description,
-     (data->>'size')::bigint as size,
-     data->>'published' as uploaded_at,
-     data
-   FROM objects
-   WHERE data->>'type' = 'Document';
-   ```
+2. **Deduplication Support**
+   - Track file_hash to identify deduplicated files
+   - Reference counting via user_uploads table
+   - Only delete physical file when no references remain
+   - Maintain separate records for each user's upload
+
+3. **Migration Strategy**
+   - Tables created empty - no automatic backfill
+   - New uploads tracked immediately after deployment
+   - Historical data populated via mix task
+   - No performance impact on existing large tables
+
+4. **Deletion Flow**
+   - When a user deletes media:
+     a. Find all activities where the user attached this media
+     b. Update each activity to remove the attachment
+     c. Federate Update activities for each modified post
+     d. Remove the user_upload record
+     e. Check if any other users reference the same file (via file_hash)
+     f. Only delete physical file if no references remain
+     g. Clean up post_uploads entries
 
 ### Security Considerations
 
@@ -232,37 +334,69 @@ GET /api/v1/pleroma/media/stats
 
 ## Implementation Phases
 
-### Phase 1: Core Functionality (3 days)
-- [ ] Create database indexes
-- [ ] Implement UserMedia module with basic queries
-- [ ] Create MediaController with list and delete endpoints
-- [ ] Add authentication and authorization
-- [ ] Basic tests
+### Phase 1: Database Foundation (TDD)
+- [ ] Write tests for UserUpload schema and changesets
+- [ ] Implement UserUpload module
+- [ ] Write tests for PostUpload schema and associations
+- [ ] Implement PostUpload module
+- [ ] Create database migrations for new tables
+- [ ] Write tests for deduplication logic
+- [ ] Implement file hash tracking
 
-### Phase 2: Enhanced Features (3 days)
-- [ ] Add filtering and search capabilities
-- [ ] Implement bulk operations
-- [ ] Create MediaStats module
-- [ ] Add media usage statistics endpoint
-- [ ] Implement caching layer
+### Phase 2: Core Upload Tracking
+- [ ] Write tests for upload creation hooks
+- [ ] Modify Upload module to create UserUpload records
+- [ ] Write tests for activity-upload associations
+- [ ] Hook into CommonAPI to create PostUpload records
+- [ ] Write tests for reference counting
+- [ ] Implement reference counting logic
 
-### Phase 3: Integration & Polish (2 days)
-- [ ] Hook into existing cleanup workers
-- [ ] Add admin controls and overrides
-- [ ] Implement audit logging
+### Phase 3: Query and API Layer
+- [ ] Write tests for UserMedia queries
+- [ ] Implement UserMedia module with ownership validation
+- [ ] Write controller tests for list endpoint
+- [ ] Implement MediaController list endpoint
+- [ ] Write controller tests for delete endpoint
+- [ ] Implement delete with deduplication safety
+
+### Phase 4: Bulk Operations and Stats
+- [ ] Write tests for bulk delete operations
+- [ ] Implement MediaDeletionWorker
+- [ ] Write tests for media statistics
+- [ ] Implement MediaStats module
+- [ ] Write tests for stats caching
+- [ ] Add caching layer
+
+### Phase 5: Historical Data Migration
+- [ ] Write tests for backfill worker
+- [ ] Implement MediaBackfillWorker
+- [ ] Write tests for mix task
+- [ ] Create mix pleroma.media.backfill task
+- [ ] Add progress tracking and resumability
+- [ ] Test with various data scenarios
+
+### Phase 6: Integration and Polish
+- [ ] Integration tests with all storage backends
+- [ ] Performance testing with large datasets
 - [ ] Add Prometheus metrics
-- [ ] Performance optimization
-
-### Phase 4: Testing & Documentation (2 days)
-- [ ] Comprehensive test suite
 - [ ] API documentation
 - [ ] Admin configuration guide
-- [ ] User documentation for PleromaFE
-- [ ] Migration guide for existing instances
+- [ ] Create troubleshooting guide
 
 ## Testing Strategy
 
+### Test-First Development
+Every feature will be developed using TDD:
+1. Write failing test describing desired behavior
+2. Write minimal code to pass the test
+3. Refactor for clarity and performance
+4. Ensure all tests remain green
+
 ### Unit Tests
+- UserUpload and PostUpload schemas and changesets
+- Deduplication logic and reference counting
+- Media deletion with post updates
+- Federation of Update activities
 - UserMedia query functions
 - MediaStats calculations
 - Authorization logic
@@ -270,15 +404,20 @@ GET /api/v1/pleroma/media/stats
 
 ### Integration Tests
 - Full API flow with different storage backends
+- Media deletion updating posts and federating
+- Deduplication scenarios with multiple users
 - Bulk operations with large datasets
 - Error handling and edge cases
 - Rate limiting behavior
+- Backfill process with various data patterns
 
 ### Performance Tests
 - Query performance with 10k+ uploads
 - Bulk deletion performance
+- Federation performance for mass updates
 - Cache effectiveness
 - Database index usage
+- Backfill performance on large instances
 
 ## Rollout Plan
 
