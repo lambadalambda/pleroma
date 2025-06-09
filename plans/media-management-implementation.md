@@ -226,8 +226,8 @@ The backfill process will work as follows:
    - Process activities in batches of 1000
    - For each local Create activity with attachments:
      a. Extract media objects from the activity
-     b. Create user_upload records with activity_id
-     c. Calculate file hash if needed
+     b. Extract file_path from the object's URL
+     c. Create user_upload records with activity_id
    - Track progress in a dedicated table
    - Allow resuming from last processed ID
 
@@ -249,8 +249,7 @@ The backfill process will work as follows:
      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
      object_id BIGINT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
      activity_id BIGINT REFERENCES activities(id) ON DELETE CASCADE, -- The Create activity for this upload
-     file_hash VARCHAR(64), -- SHA256 hash for deduplication tracking
-     file_path TEXT NOT NULL,
+     file_path TEXT NOT NULL, -- With Dedupe filter, path contains the hash
      file_size BIGINT NOT NULL,
      content_type VARCHAR(255),
      description TEXT,
@@ -262,7 +261,7 @@ The backfill process will work as follows:
    CREATE INDEX user_uploads_user_id_idx ON user_uploads(user_id);
    CREATE INDEX user_uploads_object_id_idx ON user_uploads(object_id);
    CREATE INDEX user_uploads_activity_id_idx ON user_uploads(activity_id);
-   CREATE INDEX user_uploads_file_hash_idx ON user_uploads(file_hash);
+   CREATE INDEX user_uploads_file_path_idx ON user_uploads(file_path); -- For dedup checks
    CREATE INDEX user_uploads_inserted_at_idx ON user_uploads(inserted_at);
    ```
    
@@ -274,10 +273,15 @@ The backfill process will work as follows:
    - No need for a separate post_uploads table
 
 2. **Deduplication Support**
-   - Track file_hash to identify deduplicated files
-   - Reference counting via user_uploads table
-   - Only delete physical file when no references remain
-   - Maintain separate records for each user's upload
+   - When Dedupe filter is enabled, file_path contains the content hash
+   - Multiple users uploading the same file will have the same file_path
+   - Reference counting via counting user_uploads with same file_path
+   - Only delete physical file when no other user_uploads reference that path
+   - Each user maintains their own upload record even for deduplicated files
+   
+   **Note**: If Dedupe filter is not enabled, each upload gets a unique path (usually UUID-based), 
+   so the same content uploaded multiple times will create multiple files. In this case, 
+   each file can be safely deleted when its user_upload record is removed.
 
 3. **Migration Strategy**
    - Tables created empty - no automatic backfill
@@ -292,8 +296,8 @@ The backfill process will work as follows:
      c. Update each activity to remove the attachment
      d. Federate Update activities for each modified post
      e. Delete the user_upload record
-     f. Check if any other users reference the same file (via file_hash)
-     g. Only delete physical file if no references remain
+     f. Check if any other user_uploads have the same file_path
+     g. Only delete physical file if no other references exist
 
 ### Security Considerations
 
@@ -329,8 +333,8 @@ The backfill process will work as follows:
 - [ ] Write tests for UserUpload schema and changesets
 - [ ] Implement UserUpload module
 - [ ] Create database migration for user_uploads table
-- [ ] Write tests for deduplication logic
-- [ ] Implement file hash tracking and reference counting
+- [ ] Write tests for deduplication logic (file_path based)
+- [ ] Implement reference counting via file_path queries
 
 ### Phase 2: Core Upload Tracking
 - [ ] Write tests for upload creation hooks
