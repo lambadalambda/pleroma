@@ -240,15 +240,15 @@ GET /api/v1/pleroma/media/stats
 2. **`Pleroma.Upload.UserUpload`**
    - Schema for user_uploads table
    - Changeset validations
-   - Query helpers for user uploads
-   - Deduplication logic
-   - Reference counting
+   - Associates users with their upload Objects
+   - Tracks when upload is used in activities
+   - Query helpers for user's uploads
 
 3. **`Pleroma.Upload.UserMedia`**
    - Core business logic
-   - Query user's uploads from UserUpload
-   - Find all activities using a media object
-   - Validation of ownership
+   - Creates user_upload records when files are uploaded
+   - Updates user_uploads when uploads are used in posts
+   - Query user's uploads (both used and unused)
    - Coordinate media deletion across activities
    - Integration with storage backends
 
@@ -310,8 +310,8 @@ The backfill process will work as follows:
      id BIGSERIAL PRIMARY KEY,
      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
      object_id BIGINT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
-     activity_id BIGINT REFERENCES activities(id) ON DELETE CASCADE, -- The Create activity for this upload
-     file_path TEXT NOT NULL, -- With Dedupe filter, path contains the hash
+     activity_id BIGINT REFERENCES activities(id) ON DELETE CASCADE, -- The Create activity when used in post
+     file_path TEXT NOT NULL,
      file_size BIGINT NOT NULL,
      content_type VARCHAR(255),
      description TEXT,
@@ -327,12 +327,12 @@ The backfill process will work as follows:
    CREATE INDEX user_uploads_inserted_at_idx ON user_uploads(inserted_at);
    ```
    
-   **Why only one table?**
-   - Activities already track which user posted (actor)
-   - Objects already contain attachments array
-   - Storing activity_id avoids slow JSONB queries
-   - Direct lookup of where media is used
-   - No need for a separate post_uploads table
+   **Back to single table design:**
+   - Uploads are immediately saved as Objects in Pleroma
+   - Objects have an "actor" field identifying the owner
+   - `user_uploads` tracks the relationship and additional metadata
+   - `activity_id` is NULL until the upload is used in a post
+   - Simpler architecture that matches Pleroma's existing flow
 
 2. **Deduplication Support**
    - When Dedupe filter is enabled, file_path contains the content hash
@@ -351,15 +351,30 @@ The backfill process will work as follows:
    - Historical data populated via mix task
    - No performance impact on existing large tables
 
-4. **Deletion Flow**
+4. **Upload and Attachment Flow**
+   - **Initial upload:**
+     a. User uploads file via media endpoint
+     b. File is stored and Object is created with type "Document"/"Image"
+     c. Object has "actor" field set to user's AP ID
+     d. Create record in `user_uploads` linking user to Object
+     e. Return Object ID to client
+   
+   - **Attachment to post:**
+     a. User creates post referencing Object ID(s)
+     b. Create activity references the attachment Objects
+     c. Update `user_uploads` with activity_id
+     d. Upload is now tracked as being used in a post
+
+5. **Deletion Flow**
    - When a user deletes media:
      a. Look up the user_upload record
-     b. Find all activities where this media is used (via activity_id and by searching attachments)
-     c. Update each activity to remove the attachment
-     d. Federate Update activities for each modified post
-     e. Delete the user_upload record
-     f. Check if any other user_uploads have the same file_path
-     g. Only delete physical file if no other references exist
+     b. If activity_id is NULL (never used in post), safe to delete Object
+     c. If activity_id exists, find all activities using this media
+     d. Update each activity to remove the attachment
+     e. Federate Update activities for each modified post
+     f. Delete the Object and user_upload records
+     g. Check if any other user_uploads have the same file_path
+     h. Only delete physical file if no other references exist
 
 ### Security Considerations
 
@@ -392,19 +407,19 @@ The backfill process will work as follows:
 ## Implementation Phases
 
 ### Phase 1: Database Foundation (TDD)
-- [ ] Write tests for UserUpload schema and changesets
+- [ ] Write tests for UserUpload schema and associations
 - [ ] Implement UserUpload module
 - [ ] Create database migration for user_uploads table
 - [ ] Write tests for deduplication logic (file_path based)
 - [ ] Implement reference counting via file_path queries
 
 ### Phase 2: Core Upload Tracking
-- [ ] Write tests for upload creation hooks
-- [ ] Modify Upload module to create UserUpload records
-- [ ] Write tests for activity association
-- [ ] Hook into CommonAPI to store activity_id in UserUpload
-- [ ] Write tests for reference counting
-- [ ] Implement reference counting logic
+- [ ] Write tests for upload Object tracking
+- [ ] Hook into ActivityPub.upload to create user_uploads records
+- [ ] Write tests for tracking upload usage in posts
+- [ ] Hook into CommonAPI to update user_uploads with activity_id
+- [ ] Write tests for unused upload cleanup
+- [ ] Implement cleanup for never-used uploads
 
 ### Phase 3: Query and API Layer
 - [ ] Write tests for UserMedia queries
