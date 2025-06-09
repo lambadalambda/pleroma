@@ -36,7 +36,69 @@ This implementation will address these gaps while integrating seamlessly with Pl
    - No dedicated indexes for user media queries
    - Attachments linked through ActivityPub object structure
 
+### Key Architectural Insights
+
+1. **ActivityPub Data Model**
+   - Activities represent actions (Create, Update, Delete, etc.)
+   - Objects contain the actual content (posts, media, etc.)
+   - Media attachments are Objects referenced in the attachments array of post Objects
+   - Create activities reference the Object they create
+   - Activities have an actor (the user who performed the action)
+
+2. **Upload Filters and Deduplication**
+   - Upload filters are applied in sequence during upload processing
+   - The Dedupe filter (when enabled) saves files as `{sha256_hash}.{extension}`
+   - File paths with Dedupe: `e3/03/97/{full_hash}.jpg` (sharded by first 6 chars)
+   - Without Dedupe: UUID-based filenames, each upload is unique
+   - The upload system already handles the complexity of deduplication
+
+3. **Object and Activity Relationships**
+   - A media Object can be referenced by multiple Activities
+   - The same media can appear in multiple posts by the same user
+   - Activities are never updated in-place; changes create Update activities
+   - Deleting content requires federating Update or Delete activities
+
+4. **Storage Architecture**
+   - File path is stored in the Object's data as the URL
+   - The URL path is relative to the upload base URL
+   - Local storage example: `/media/e3/03/97/hash.jpg` → file at `uploads/e3/03/97/hash.jpg`
+   - Multiple uploaders (Local, S3, IPFS) all follow the same path conventions
+   - Physical file deletion is handled by the uploader module
+   - Need to extract relative path from full URL for storage tracking
+
+5. **Performance Considerations**
+   - JSONB queries on large tables can be slow
+   - Adding indexes to existing large tables can cause downtime
+   - New tables with proper indexes are preferred over modifying existing ones
+   - Direct foreign key relationships are much faster than JSONB searches
+
 ## Implementation Design
+
+### Important Implementation Notes
+
+1. **Media Upload Flow**
+   - User uploads file → Create activity is generated → Upload filters run → Object is created
+   - The Object contains the media metadata and file path
+   - The Create activity references this Object
+   - Both are saved before the upload completes
+
+2. **Finding Media in Posts**
+   - Post Objects have `attachment` field containing array of media Objects
+   - Media Objects have `type: "Document"` (or "Image", "Video", etc.)
+   - Can search via: `WHERE data->'attachment' @> '[{"id": "object_id"}]'`
+   - But direct activity_id reference is much faster
+
+3. **Federation Considerations**
+   - Modifying a post requires sending Update activity to followers
+   - The Update must contain the complete modified Object
+   - Remote instances will update their cached version
+   - Must preserve all other fields when removing attachments
+
+4. **Edge Cases to Handle**
+   - Media used in user's avatar/banner (check User's avatar/banner fields)
+   - Media in scheduled posts (check ScheduledActivity)
+   - Media in drafts (if implemented)
+   - Media referenced but file already deleted (handle gracefully)
 
 ### Test-Driven Development Approach
 
