@@ -1539,11 +1539,77 @@ defmodule Pleroma.Web.ActivityPub.ActivityPub do
 
   @spec upload(Upload.source(), keyword()) :: {:ok, Object.t()} | {:error, any()}
   def upload(file, opts \\ []) do
-    with {:ok, data} <- Upload.store(sanitize_upload_file(file), opts) do
+    sanitized_file = sanitize_upload_file(file)
+
+    # Get file size before upload
+    file_size = get_upload_file_size(sanitized_file)
+
+    with {:ok, data} <- Upload.store(sanitized_file, opts) do
       obj_data = Maps.put_if_present(data, "actor", opts[:actor])
 
-      Repo.insert(%Object{data: obj_data})
+      with {:ok, object} <- Repo.insert(%Object{data: obj_data}) do
+        # Create UserUpload record if actor is provided
+        if actor_ap_id = opts[:actor] do
+          create_user_upload(actor_ap_id, object, data, file_size, opts)
+        end
+
+        {:ok, object}
+      end
     end
+  end
+
+  defp get_upload_file_size(%Plug.Upload{path: path}) do
+    case File.stat(path) do
+      {:ok, %File.Stat{size: size}} -> size
+      _ -> 0
+    end
+  end
+
+  defp get_upload_file_size(_), do: 0
+
+  defp create_user_upload(actor_ap_id, object, upload_data, file_size, opts) do
+    with %User{id: user_id} <- User.get_cached_by_ap_id(actor_ap_id) do
+      # Extract file path from the upload URL
+      file_path = extract_file_path_from_url(upload_data)
+
+      # Get content type
+      content_type = Map.get(upload_data, "mediaType")
+
+      # Get description from opts or data
+      description = opts[:description] || Map.get(upload_data, "name")
+
+      Upload.UserUpload.create(%{
+        user_id: user_id,
+        object_id: object.id,
+        file_path: file_path,
+        file_size: file_size,
+        content_type: content_type,
+        description: description
+      })
+    else
+      _ -> {:error, :user_not_found}
+    end
+  end
+
+  defp extract_file_path_from_url(%{"url" => urls}) when is_list(urls) do
+    urls
+    |> List.first()
+    |> Map.get("href", "")
+    |> extract_file_path_from_url_string()
+  end
+
+  defp extract_file_path_from_url(%{"url" => url}) when is_binary(url) do
+    extract_file_path_from_url_string(url)
+  end
+
+  defp extract_file_path_from_url(_), do: ""
+
+  defp extract_file_path_from_url_string(url) do
+    uri = URI.parse(url)
+    path = uri.path || ""
+
+    # Remove /media/ prefix if present
+    String.replace_prefix(path, "/media/", "")
   end
 
   defp sanitize_upload_file(%Plug.Upload{filename: filename} = upload) when is_binary(filename) do
